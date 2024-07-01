@@ -13,12 +13,35 @@ Unforgettableness establishes safety contract between objects/entities, usually 
 As such unforgtettable type should be safe to forget if it outlives every lifetime that aforementioned operational object/entity is able to outlive, which is enforced with the `Unforget` wrapper.
 Because currently every type is assumed to be safely forgettable, this feature nessecitates default `Forget` bounds on every type parameter, its associated types, and outside values inside of old macro expansions.
 
-<!-- TODO -->
+This feature would allow now removed safe [`std::thread::scoped`] API while actually fixing the unsoundness issue [#24292](https://github.com/rust-lang/rust/issues/24292). While to some extend the new [`std::thread::scope`] allows to circumvent the `'static` closure requirement, it is not generally applicable to the async/await code.
 
 # Motivation
 [motivation]: #motivation
 
-Why are we doing this? What use cases does it support? What is the expected outcome?
+In cases where an API requires some cleanup code to run for it to safely operate on non-static values, no universal solution have yet been found.
+For example, as described in the [summary], there is a way to send non-static closures to other threads using stable [`std::thread::scope`], but it disallows `.await` points while working with `std::thread::ScopedJoinHandle`s and is generally a bit unflexible.
+
+```rust
+let a = vec![1, 2, 3];
+
+// cannot send borrows since spawned thread can outlive borrowed lifetime if we forget its `JoinHandle`
+let thrd = std::thread::spawn(|| {
+    dbg!(&a);
+});
+
+// this function takes closure, it is impossible to `.await` within its body
+std::thread::scope(|s| {
+    s.spawn(|| {
+        dbg!(&a);
+    });
+});
+```
+
+In particular there can hypothetically be a function or a method that returns some object which mutably (exclusively) borrows one of the function's arguments.
+While returned object is alive user is unable to refer to borrowed value, which can be a useful property to exploit.
+Library author can invalidate some public safety invariant of a borrowed type but then restore it inside of the object's drop.
+However given the fact that forgetting such object is would be safe, it is impossible to make such sound safe API.
+There is one known example of this as once mentioned planned feature [`Vec::drain_range`](https://github.com/rust-lang/rust/issues/24292#issuecomment-93513451).
 
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
@@ -102,3 +125,6 @@ Note that having something written down in the future-possibilities section
 is not a reason to accept the current or a future RFC; such notes should be
 in the section on motivation or rationale in this or subsequent RFCs.
 The section merely provides additional information.
+
+[`std::thread::scoped`]: https://doc.rust-lang.org/1.0.0/std/thread/fn.scoped.html
+[`std::thread::scope`]: https://doc.rust-lang.org/1.79.0/std/thread/fn.scope.html
