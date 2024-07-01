@@ -46,6 +46,82 @@ There is one known example of this as once mentioned planned feature [`Vec::drai
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
 
+To implement an object that requires execution of drop to not cause UB you would have to utilize `Unforget` type.
+
+<!-- TODO: Easier example -->
+
+```rust
+use std::num::NonZeroI32;
+
+pub struct NonZeroI32RefMut<'borrow, 'limit> {
+    inner: &'borrow mut i32,
+    _limit: PhantomData<fn(&'limit ())>,
+}
+
+impl<'borrow, 'limit> NonZeroI32RefMut<'borrow, 'limit> {
+    pub fn new<'a>(x: &'a mut i32) -> Option<Self>
+    where
+        'a: 'borrow,
+        'limit: 'a,
+    {
+        if *x != 0 {
+            Some(NonZeroI32RefMut {
+                inner: x,
+                limit: PhantomData,
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn get(&self) -> NonZeroI32 {
+        unsafe { NonZeroI32::new_unchecked(*self.inner) }
+    }
+
+    pub fn set(&mut self, new: NonZeroI32) {
+        *self.inner = new.get();
+    }
+
+    pub fn borrow_as_zeroable<'reborrow>(
+        &'reborrow mut self,
+        fallback: NonZeroI32,
+    ) -> ZeroableI32Ref<'reborrow, 'limit>
+    where
+        'borrow: 'reborrow,
+    {
+        ZeroableI32RefMut {
+            borrowed: Unforget::new(self),
+            fallback,
+        }
+    }
+}
+
+pub struct ZeroableI32RefMut<'borrow, 'limit> {
+    borrowed: Unforget<'limit, &'borrow mut NonZeroI32RefMut<'borrow, 'limit>>,
+    fallback: NonZeroI32,
+}
+
+impl ZeroableI32RefMut<'_, '_> {
+    pub fn get(&self) -> i32 {
+        *self.borrowed.inner
+    }
+
+    pub fn set(&mut self, new: i32) {
+        *self.borrowed.inner = new;
+    }
+}
+
+impl Drop for ZeroableI32RefMut<'_, '_> {
+    fn drop(&mut self) {
+        if *self.borrowed.inner == 0 {
+            *self.borrowed.inner = self.fallback;
+        }
+    }
+}
+```
+
+<!-- TODO -->
+
 Explain the proposal as if it was already included in the language and you were teaching it to another Rust programmer. That generally means:
 
 - Introducing new named concepts.
