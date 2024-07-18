@@ -19,7 +19,8 @@ This feature would allow now removed safe [`std::thread::scoped`] API while actu
 [motivation]: #motivation
 
 In cases where an API requires some cleanup code to run for it to safely operate on non-static values, no universal solution have yet been found.
-For example, as described in the [summary], there is a way to send non-static closures to other threads using stable [`std::thread::scope`], but it disallows `.await` points while working with `std::thread::ScopedJoinHandle`s and is generally a bit unflexible.
+For example, as described in the [summary], there is a way to send non-static closures to other threads using stable [`std::thread::scope`],
+but it disallows `.await` points while working with `std::thread::ScopedJoinHandle`s and is generally a bit unflexible.
 
 ```rust
 let a = vec![1, 2, 3];
@@ -46,76 +47,72 @@ There is one known example of this as once mentioned planned feature [`Vec::drai
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
 
-To implement an object that requires execution of drop to not cause UB you would have to utilize `Unforget` type.
+It's important to note that in every example from above the lifetimes are involved.
+The unforgetness of a type works in harmony with the borrow checker.
 
-<!-- TODO: Easier example -->
+The `Forget` auto trait is at the center of this proposal, used to distinguish whether a type is allowed to be forgotten or not.
+It is marked unsafe so that the unsafe code would be able to rely on it.
+Since forgetting or leaking an object is usually considered to be a logic bug there's a little to no utility in the safe variantion of this trait.
 
 ```rust
-use std::num::NonZeroI32;
+unsafe auto trait Forget {}
+```
 
-pub struct NonZeroI32RefMut<'borrow, 'limit> {
-    inner: &'borrow mut i32,
-    _limit: PhantomData<fn(&'limit ())>,
+Of course every old type has to be forgettable and implement the `Forget` trait, so there must be an escape mechanism to define unforgettable type.
+For that there exists a special wrapper type `Unforget`, with interface similar to `ManuallyDrop`.
+
+```rust
+#[repr(transparent)]
+pub struct Unforget<'a, T: ?Sized> {
+    // ...
 }
+```
 
-impl<'borrow, 'limit> NonZeroI32RefMut<'borrow, 'limit> {
-    pub fn new<'a>(x: &'a mut i32) -> Option<Self>
-    where
-        'a: 'borrow,
-        'limit: 'a,
-    {
-        if *x != 0 {
-            Some(NonZeroI32RefMut {
-                inner: x,
-                limit: PhantomData,
-            })
-        } else {
-            None
-        }
-    }
+Overall interface is similar to `ManuallyDrop`. But aside from `T` generic type parameter there is a (contravariant) lifetime parameter `'a`.
+Its purpose is to simply implement `Forget` on the type if `T: 'a`, which is described in detail within the [reference-level-explanation] section.
 
-    pub fn get(&self) -> NonZeroI32 {
-        unsafe { NonZeroI32::new_unchecked(*self.inner) }
-    }
+```rust
+unsafe impl<'a, T: ?Sized + 'a> Forget for Unforget<'a, T> {}
+```
 
-    pub fn set(&mut self, new: NonZeroI32) {
-        *self.inner = new.get();
-    }
 
-    pub fn borrow_as_zeroable<'reborrow>(
-        &'reborrow mut self,
-        fallback: NonZeroI32,
-    ) -> ZeroableI32Ref<'reborrow, 'limit>
-    where
-        'borrow: 'reborrow,
-    {
-        ZeroableI32RefMut {
-            borrowed: Unforget::new(self),
-            fallback,
-        }
-    }
-}
+To implement an object that requires execution of drop to not cause UB you would have to disallow implementation of the `Forget` trait on it.
+There's the `Unforget` wrapper type for that exact reason. Here is an example of that:
 
-pub struct ZeroableI32RefMut<'borrow, 'limit> {
-    borrowed: Unforget<'limit, &'borrow mut NonZeroI32RefMut<'borrow, 'limit>>,
-    fallback: NonZeroI32,
-}
+```rust
+// NOTE: This code may be opinionated and is only an example implementation of the `JoinGuard` type.
 
-impl ZeroableI32RefMut<'_, '_> {
-    pub fn get(&self) -> i32 {
-        *self.borrowed.inner
-    }
+/// Handle to a thread, which joins on drop.
+pub struct JoinGuard<'a, T> {
+    child: ManuallyDrop<thread::JoinHandle<T>>,
+    _unforget: Unforget<'static, PhantomData<&'a ()>>,
+    /// Cannot be sent across threads to not accedentally send it to itself, thus forgetting it.
+    /// So this struct is marked as `!Send`.
+    _unsend: PhantomData<*mut ()>,
+} 
 
-    pub fn set(&mut self, new: i32) {
-        *self.borrowed.inner = new;
-    }
-}
+unsafe impl<T> Send for JoinGuard<'_, T> where Self: Forget {}
+unsafe impl<T> Sync for JoinGuard<'_, T> {}
 
-impl Drop for ZeroableI32RefMut<'_, '_> {
+impl<'a, T> Drop for JoinGuard<'a, T> {
     fn drop(&mut self) {
-        if *self.borrowed.inner == 0 {
-            *self.borrowed.inner = self.fallback;
-        }
+        let _ = unsafe { ManuallyDrop::take(&mut self.child) }.join();
+    }
+}
+
+pub fn spawn_scoped<'a, F, T>(f: F) -> JoinGuard<'a, T>
+where
+    F: FnOnce() -> T + Send + 'a,
+    T: Send + 'a,
+{
+    JoinGuard {
+        // SAFETY: Thread is joined in the drop implementation, `JoinGuard` is an unforgettable type
+        // because of the `_unforget` field's type
+        child: unsafe {
+            ManuallyDrop::new_unchecked(thread::Builder::new().spawn_unchecked(f).unwrap())
+        },
+        _unforget: Unforget::new(PhantomData),
+        _unsend: PhantomData,
     }
 }
 ```
