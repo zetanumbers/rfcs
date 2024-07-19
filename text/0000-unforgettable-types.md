@@ -47,37 +47,43 @@ There is one known example of this as once mentioned planned feature [`Vec::drai
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
 
-It's important to note that in every example from above the lifetimes are involved.
-The unforgetness of a type works in harmony with the borrow checker.
+<!-- Should this section require knowledge of auto traits? -->
+The `Forget` trait is at the center of this proposal, used to distinguish whether a type is allowed to be forgotten or not via `T: Forget` bound.
+It's marked unsafe so that the unsafe code would be able to safely rely on it.
+Since forgetting or leaking an object is usually considered to be a logic bug anyway, there's little to no utility in the safe variantion.
 
-The `Forget` auto trait is at the center of this proposal, used to distinguish whether a type is allowed to be forgotten or not.
-It is marked unsafe so that the unsafe code would be able to rely on it.
-Since forgetting or leaking an object is usually considered to be a logic bug there's a little to no utility in the safe variantion of this trait.
-
+<!-- MOVE(reference):
 ```rust
 unsafe auto trait Forget {}
 ```
 
-Of course every old type has to be forgettable and implement the `Forget` trait, so there must be an escape mechanism to define unforgettable type.
-For that there exists a special wrapper type `Unforget`, with interface similar to `ManuallyDrop`.
+The unforgetness works in harmony with the borrow checker.
+-->
 
+The `T: Forget` bounds usually appear where drop on values of type `T` may not be called, that includes:
+
+- Obviously the `forget` function;
+- `ManuallyDrop` and `MaybeUninit` types as they disable drop;
+- `Rc` and `Arc` types as they may create ownership cycle ([The Rust Programming Language - Chapter 15.6](https://doc.rust-lang.org/book/ch15-06-reference-cycles.html#reference-cycles-can-leak-memory));
+- MOVE(reference): Threads also can be used to create ownership cycles.
+- etc.
+
+To mark type as unforgettable there's a special wrapper type called `Unforget<'a, T>`, with interface similar to the `ManuallyDrop<T>`.
+Overall interface is similar to `ManuallyDrop`, except for a lifetime parameter `'a` which purpose is explained in the [reference-level-explanation] section.
+For now the `'static` lifetime should be considered its default lifetime.
+
+<!-- MOVE(reference):
 ```rust
 #[repr(transparent)]
 pub struct Unforget<'a, T: ?Sized> {
     // ...
 }
-```
 
-Overall interface is similar to `ManuallyDrop`. But aside from `T` generic type parameter there is a (contravariant) lifetime parameter `'a`.
-Its purpose is to simply implement `Forget` on the type if `T: 'a`, which is described in detail within the [reference-level-explanation] section.
-
-```rust
 unsafe impl<'a, T: ?Sized + 'a> Forget for Unforget<'a, T> {}
 ```
+-->
 
-
-To implement an object that requires execution of drop to not cause UB you would have to disallow implementation of the `Forget` trait on it.
-There's the `Unforget` wrapper type for that exact reason. Here is an example of that:
+TODO(reword): Example of the `JoinGuard` implementation:
 
 ```rust
 // NOTE: This code may be opinionated and is only an example implementation of the `JoinGuard` type.
@@ -86,16 +92,12 @@ There's the `Unforget` wrapper type for that exact reason. Here is an example of
 pub struct JoinGuard<'a, T> {
     child: ManuallyDrop<thread::JoinHandle<T>>,
     _unforget: Unforget<'static, PhantomData<&'a ()>>,
-    /// Cannot be sent across threads to not accedentally send it to itself, thus forgetting it.
-    /// So this struct is marked as `!Send`.
-    _unsend: PhantomData<*mut ()>,
+    // ...
 } 
-
-unsafe impl<T> Send for JoinGuard<'_, T> where Self: Forget {}
-unsafe impl<T> Sync for JoinGuard<'_, T> {}
 
 impl<'a, T> Drop for JoinGuard<'a, T> {
     fn drop(&mut self) {
+        // SAFETY: We are in the drop, so the `self.child` field will no longer be used.
         let _ = unsafe { ManuallyDrop::take(&mut self.child) }.join();
     }
 }
@@ -106,18 +108,34 @@ where
     T: Send + 'a,
 {
     JoinGuard {
-        // SAFETY: Thread is joined in the drop implementation, `JoinGuard` is an unforgettable type
-        // because of the `_unforget` field's type
+        // SAFETY: Thread is joined in the drop implementation, `JoinGuard` is an
+        // unforgettable type because of the `_unforget` field's type
         child: unsafe {
             ManuallyDrop::new_unchecked(thread::Builder::new().spawn_unchecked(f).unwrap())
         },
         _unforget: Unforget::new(PhantomData),
-        _unsend: PhantomData,
+        // ...
     }
 }
 ```
 
+TODO(reword):
+Cannot be sent across threads to not accedentally send it to itself, thus forgetting it.
+So this struct is marked as `!Send`.
+JoinGuard is !Send to not create an ownership cycle:
+
+```rust
+pub struct JoinGuard<'a, T> {
+    // ...
+    _unsend: PhantomData<*mut ()>,
+}
+
+unsafe impl<T> Send for JoinGuard<'_, T> where Self: Forget {}
+unsafe impl<T> Sync for JoinGuard<'_, T> {}
+```
+
 <!-- TODO -->
+----
 
 Explain the proposal as if it was already included in the language and you were teaching it to another Rust programmer. That generally means:
 
