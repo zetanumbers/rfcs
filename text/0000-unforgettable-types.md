@@ -9,11 +9,18 @@
 [summary]: #summary
 
 Add an auto trait `Forget` to indicate which types are safe to forget and special `Unforget` wrapper type to constrain `Forget`'s implementation.
-Unforgettableness establishes safety contract between objects/entities, usually between borrows and an operational object/entity, i.e. a borrow from the stack and the thread manager in case of now removed [`std::thread::JoinGuard`](https://doc.rust-lang.org/1.0.0/std/thread/struct.JoinGuard.html).
-As such unforgtettable type should be safe to forget if it outlives every lifetime that aforementioned operational object/entity is able to outlive, which is enforced with the `Unforget` wrapper.
-Because currently every type is assumed to be safely forgettable, this feature nessecitates default `Forget` bounds on every type parameter, its associated types, and outside values inside of old macro expansions.
+Unforgettableness establishes a safety contract between objects/entities, usually between borrows and an operational object/entity,
+i.e. a borrow from the stack and the thread manager in case of now removed [`std::thread::JoinGuard`].
 
-This feature would allow now removed safe [`std::thread::scoped`] API while actually fixing the unsoundness issue [#24292](https://github.com/rust-lang/rust/issues/24292). While to some extend the new [`std::thread::scope`] allows to circumvent the `'static` closure requirement, it is not generally applicable to the async/await code.
+As such unforgtettable type should be safe to forget if it outlives every lifetime that aforementioned operational object/entity is able to outlive, which is enforced with the `Unforget` wrapper.
+
+Because currently every type is assumed to be safely forgettable, this feature nessecitates implicit `Forget` bounds on every used type and object in, so called, old code.
+New and old code should be distinguished by the new code containg syntax indicating explicit support for unforgettable types,
+this potentially being the crate's edition or some other syntax possibly similar albeit orthogonal to the edition system.
+Tools like `cargo fix` may assist migration from old to new code.
+
+This feature would allow now removed safe [`std::thread::scoped`] API while actually fixing the unsoundness issue [#24292](https://github.com/rust-lang/rust/issues/24292).
+While to some extend the new [`std::thread::scope`] allows to circumvent the `'static` closure requirement, it is not generally applicable to the async/await code.
 
 # Motivation
 [motivation]: #motivation
@@ -47,18 +54,9 @@ There is one known example of this as once mentioned planned feature [`Vec::drai
 # Guide-level explanation
 [guide-level-explanation]: #guide-level-explanation
 
-<!-- Should this section require knowledge of auto traits? -->
 The `Forget` trait is at the center of this proposal, used to distinguish whether a type is allowed to be forgotten or not via `T: Forget` bound.
 It's marked unsafe so that the unsafe code would be able to safely rely on it.
 Since forgetting or leaking an object is usually considered to be a logic bug anyway, there's little to no utility in the safe variantion.
-
-<!-- MOVE(reference):
-```rust
-unsafe auto trait Forget {}
-```
-
-The unforgetness works in harmony with the borrow checker.
--->
 
 The `T: Forget` bounds usually appear where drop on values of type `T` may not be called, that includes:
 
@@ -72,21 +70,13 @@ To mark type as unforgettable there's a special wrapper type called `Unforget<'a
 Overall interface is similar to `ManuallyDrop`, except for a lifetime parameter `'a` which purpose is explained in the [reference-level-explanation] section.
 For now the `'static` lifetime should be considered its default lifetime.
 
-<!-- MOVE(reference):
-```rust
-#[repr(transparent)]
-pub struct Unforget<'a, T: ?Sized> {
-    // ...
-}
-
-unsafe impl<'a, T: ?Sized + 'a> Forget for Unforget<'a, T> {}
-```
--->
-
-TODO(reword): Example of the `JoinGuard` implementation:
+To implement safe [`std::thread::JoinGuard`] once again, such type must be marked as unforgettable:
 
 ```rust
 // NOTE: This code may be opinionated and is only an example implementation of the `JoinGuard` type.
+
+use std::mem::ManuallyDrop;
+use std::thread;
 
 /// Handle to a thread, which joins on drop.
 pub struct JoinGuard<'a, T> {
@@ -97,7 +87,7 @@ pub struct JoinGuard<'a, T> {
 
 impl<'a, T> Drop for JoinGuard<'a, T> {
     fn drop(&mut self) {
-        // SAFETY: We are in the drop, so the `self.child` field will no longer be used.
+        // SAFETY: We are in the drop, so the `self.child` field won't be used again.
         let _ = unsafe { ManuallyDrop::take(&mut self.child) }.join();
     }
 }
@@ -119,10 +109,8 @@ where
 }
 ```
 
-TODO(reword):
-Cannot be sent across threads to not accedentally send it to itself, thus forgetting it.
-So this struct is marked as `!Send`.
-JoinGuard is !Send to not create an ownership cycle:
+However there's one last aspect that should be accounted as it is possible to send `JoinGuard` to the thread it "holds", essentially creating an ownership loop and forgetting it.
+Thus it must be `!Send` to disallow sending between threads, unless forgetting is allowed:
 
 ```rust
 pub struct JoinGuard<'a, T> {
@@ -134,7 +122,23 @@ unsafe impl<T> Send for JoinGuard<'_, T> where Self: Forget {}
 unsafe impl<T> Sync for JoinGuard<'_, T> {}
 ```
 
-<!-- TODO -->
+Some perculiar properties can be observed there when `T: 'static`, forgetting and sending `JoinGuard` to other threads becomes allowed.
+It would be possible to implement the old `std::thread::JoinHandle` using only `JoinGuard`, assuming sensible methods like `detach` and `join` were added to it.
+Anyway there is an experimental implementation of this type is at <!-- TODO -->
+
+On the other hand to support unforgettable types library author must explicitly allow unforgettable types and objects in their code.
+This RFC doesn't hold weight on any specific syntax for this, so these are some possibly variants:
+
+- Crate's edition `edition = "20XX"` would 
+
+```toml
+# Cargo.toml
+
+[package]
+# ...
+edition = "20XX" # some next edition will
+```
+
 ----
 
 Explain the proposal as if it was already included in the language and you were teaching it to another Rust programmer. That generally means:
@@ -150,6 +154,26 @@ For implementation-oriented RFCs (e.g. for compiler internals), this section sho
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
+
+<!--
+```rust
+unsafe auto trait Forget {}
+```
+
+The unforgetness works in harmony with the borrow checker.
+
+```rust
+#[repr(transparent)]
+pub struct Unforget<'a, T: ?Sized> {
+    // ...
+}
+
+unsafe impl<'a, T: ?Sized + 'a> Forget for Unforget<'a, T> {}
+```
+-->
+
+
+----
 
 This is the technical portion of the RFC. Explain the design in sufficient detail that:
 
@@ -218,4 +242,5 @@ in the section on motivation or rationale in this or subsequent RFCs.
 The section merely provides additional information.
 
 [`std::thread::scoped`]: https://doc.rust-lang.org/1.0.0/std/thread/fn.scoped.html
+[`std::thread::JoinGuard`]: https://doc.rust-lang.org/1.0.0/std/thread/struct.JoinGuard.html
 [`std::thread::scope`]: https://doc.rust-lang.org/1.79.0/std/thread/fn.scope.html
