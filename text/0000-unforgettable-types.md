@@ -62,13 +62,13 @@ The `T: Forget` bounds usually appear where drop on values of type `T` may not b
 
 - Obviously the `forget` function;
 - `ManuallyDrop` and `MaybeUninit` types as they disable drop;
-- `Rc` and `Arc` types as they may create ownership cycle ([The Rust Programming Language - Chapter 15.6](https://doc.rust-lang.org/book/ch15-06-reference-cycles.html#reference-cycles-can-leak-memory));
-- MOVE(reference): Threads also can be used to create ownership cycles.
+- `Rc` and `Arc` types as they allow creation of an ownership cycle ([The Rust Programming Language - Chapter 15.6](https://doc.rust-lang.org/book/ch15-06-reference-cycles.html#reference-cycles-can-leak-memory));
+- `std::sync::mpsc::(sync_)channel` and other channel types as they allow creation of an ownership cycle;
 - etc.
 
 To mark type as unforgettable there's a special wrapper type called `Unforget<'a, T>`, with interface similar to the `ManuallyDrop<T>`.
 Overall interface is similar to `ManuallyDrop`, except for a lifetime parameter `'a` which purpose is explained in the [reference-level-explanation] section.
-For now the `'static` lifetime should be considered its default lifetime.
+For now the `'static` lifetime should be considered its default lifetime,
 
 To implement safe [`std::thread::JoinGuard`] once again, such type must be marked as unforgettable:
 
@@ -83,7 +83,7 @@ pub struct JoinGuard<'a, T> {
     child: ManuallyDrop<thread::JoinHandle<T>>,
     _unforget: Unforget<'static, PhantomData<&'a ()>>,
     // ...
-} 
+}
 
 impl<'a, T> Drop for JoinGuard<'a, T> {
     fn drop(&mut self) {
@@ -123,24 +123,29 @@ unsafe impl<T> Sync for JoinGuard<'_, T> {}
 ```
 
 Some perculiar properties can be observed there when `T: 'static`, forgetting and sending `JoinGuard` to other threads becomes allowed.
+Generally for any type `T: 'static` the `T: Forget` also holds true.
 It would be possible to implement the old `std::thread::JoinHandle` using only `JoinGuard`, assuming sensible methods like `detach` and `join` were added to it.
-Anyway there is an experimental implementation of this type is at <!-- TODO -->
+The documentation of one such example implementation can be seen at [zetanumbers/leak-playground](https://zetanumbers.github.io/leak-playground/leak_playground_std).
 
 On the other hand to support unforgettable types library author must explicitly allow unforgettable types and objects in their code.
-This RFC doesn't hold weight on any specific syntax for this, so these are some possibly variants:
+This RFC doesn't weight on any specific syntax nor its locality characteristics, so these are some possible approaches:
 
-- Crate's edition `edition = "20XX"` would 
+- Trait bounds with a question mark `?Forget`;
+- Some next rust edition `edition = "20XX"` no longer assumes every type is forgettable and explicit `Forget` bounds are placed wherever forgetness is required;
+- Attribute over some code `#![support(unforgettable_types)]` is placed and explicit `Forget` bounds are used wherever forgetness is required.
 
-```toml
-# Cargo.toml
+The reason for such requirement is that the old code may otherwise assume any type is forgettable.
+Adding support for unforgettable types in a package may happen in different ways depending on the present code:
 
-[package]
-# ...
-edition = "20XX" # some next edition will
-```
+- In case approach with explicit `Forget` bounds will be taken, author of any crate may switch from assumed forgetness to explicit `Forget` bounds without updating dependencies or any breaking changes to the API:
+  - Assuming each package is sound by itself, any package without unsafe can be automatically migrated by tools like `cargo fix`, by specifying explicit `Forget` bounds anywhere it's required;
+  - Any package containing internal unsafe code should conservativelly work only on forgettable types until code is checked to ensure no unforgettable object can be forgotten or leaked;
+  - Any package containing public unsafe interfaces should conservativelly work only on forgettable types until API is checked to ensure no unforgettable object can be forgotten or leaked without adding new safety requirements to the documentation as that would be a breaking change;
+- In case approach with explicit `?Forget` bounds will be taken, some crates should consider adding a support for unforgettable types first:
+  1. Crates operating on futures like various async executors or traits [`StreamExt`](https://docs.rs/futures-util/0.3.30/futures_util/stream/trait.StreamExt.html), [`Sink`](https://docs.rs/futures-util/0.3.30/futures_util/sink/trait.SinkExt.html) and similar, as using unforgettable types would mostly affect async blocks making them also unforgettable;
+  2. Crates operating on closures like for methods of `Iterator` trait, `Option`, `Result` types or [some client types], as passing unforgettable types into closures would make them also unforgettable.
 
-----
-
+<!--
 Explain the proposal as if it was already included in the language and you were teaching it to another Rust programmer. That generally means:
 
 - Introducing new named concepts.
@@ -151,6 +156,7 @@ Explain the proposal as if it was already included in the language and you were 
 - Discuss how this impacts the ability to read, understand, and maintain Rust code. Code is read and modified far more often than written; will the proposed feature make code easier to maintain?
 
 For implementation-oriented RFCs (e.g. for compiler internals), this section should focus on how compiler contributors should think about the change, and give examples of its concrete impact. For policy RFCs, this section should provide an example-driven introduction to the policy, and explain its impact in concrete terms.
+-->
 
 # Reference-level explanation
 [reference-level-explanation]: #reference-level-explanation
@@ -185,6 +191,40 @@ The section should return to the examples given in the previous section, and exp
 
 # Drawbacks
 [drawbacks]: #drawbacks
+
+The main issue with this proposal is old code's incompatibility with new hypothetical types like `JoinGuard` whenever it wasn't spawned with a `'static` closure.
+It would harm rust-lang's ergonomics as everything that might be able take unforgettable objects should be able to, otherwise introducing the redundant forgetness constraint.
+Such constrain would contradict addition of unforgettable types as these two facts would discourage each other's use when usecases intersect.
+However this intersection might be negligible as only `JoinGuard`, [some client types] and `ScopedAsyncTask` will gain from this feature.
+
+Old macros may expand into a code which would forget/leak a type without violating any `T: Forget` bound:
+
+```rust
+macro_rules! forget {
+    ($b:expr) => {{
+        // $b must be sized as we pass it to the `Box::new` by value
+        let mut b = Some(Box::new($b));
+        let byte_size = std::mem::size_of_val(&b);
+        let p = (std::ptr::addr_of_mut!(b) as *mut u8);
+        for i in 0..byte_size {
+            unsafe { *p.add(i) = 0 };
+        }
+    }};
+}
+```
+
+As such, macros with unsafe code should carefully take individual measures to ensure no unforgettable object is forgotten or leaked, possibly somehow conservativelly marking macro for compiler to know it's lack of support of unforgettable types in the maner of the old code.
+However it might be better to just break such niche code from the compiler side anyway, but cost of this move is hard to estimate.
+
+By implicitly disabling `T: Forget` default bound in next edition, some old documentation and learning materials might similarly become outdated and start containing instructions to or samples of unsound unsafe code when unforgettable types are taken into the account.
+<!-- TODO: There should be some examples of that -->
+
+<!-- Enabling placing default implicit `T: Forget` bound might significantly increase compilation times due to increasing complexity of the proof conducted by the type system.
+Given this dificult situation it would be useful to correlate compilation time to the amount of syntax in the program.
+To achieve that it would require instead of implicitly creating `T: Forget` predicates unless `T: ?Forget` is written, maybe introduce `T: ?Forget` predicates for that syntax instead similarly to coinduction. -->
+<!-- No measurements were taken yet due to introduced deadlocks -->
+
+---
 
 Why should we *not* do this?
 
@@ -244,3 +284,4 @@ The section merely provides additional information.
 [`std::thread::scoped`]: https://doc.rust-lang.org/1.0.0/std/thread/fn.scoped.html
 [`std::thread::JoinGuard`]: https://doc.rust-lang.org/1.0.0/std/thread/struct.JoinGuard.html
 [`std::thread::scope`]: https://doc.rust-lang.org/1.79.0/std/thread/fn.scope.html
+[some client types]: https://docs.rs/tigerbeetle-unofficial/0.4.0+0.15.3/tigerbeetle_unofficial/struct.Client.html
